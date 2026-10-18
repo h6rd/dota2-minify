@@ -2,15 +2,28 @@ import gzip
 import io
 import json
 import os
+import threading
 import time
+from urllib.parse import urlparse
 
 import requests
-from core import base, config, fs, utils
+from core import base, config, fs, output, utils
 
 # D2PFX Browser Constants
 BASE_URL = "https://raw.githubusercontent.com/h6rd/Dota2PornFxWeb/data/"
 ASSETS_URL = "https://raw.githubusercontent.com/h6rd/Dota2PornFxWeb/main/assets/files/"
 PREVIEWS_URL = "https://raw.githubusercontent.com/h6rd/Dota2PornFxWeb/main/assets/previews/"
+
+# Hugging Face fallback
+HF_BASE_URL = "https://huggingface.co/datasets/hrdq/Dota2PornFx/resolve/data/"
+HF_ASSETS_URL = "https://huggingface.co/datasets/hrdq/Dota2PornFx/resolve/main/assets/files/"
+HF_PREVIEWS_URL = "https://huggingface.co/datasets/hrdq/Dota2PornFx/resolve/main/assets/previews/"
+
+URL_FALLBACK_MAP = [
+    (ASSETS_URL, HF_ASSETS_URL),
+    (PREVIEWS_URL, HF_PREVIEWS_URL),
+]
+
 CACHE_DIR = os.path.join(base.cache_dir, "plugins", "d2pfx")
 BLACKLIST = [
     "guides",
@@ -27,18 +40,112 @@ BLACKLIST = [
 
 
 class DataManager:
+    HOST_REACHABLE_CACHE = {}
+    REACHABILITY_TTL = 60
+    UNREACHABLE_TTL = 5
+    NOTIFIED = set()
+    _LOCK = threading.RLock()
+
     def __init__(self):
         self.cache_dir = CACHE_DIR
         fs.create_dirs(self.cache_dir)
         self.metadata = {}
         self.constants = {}
 
-    def download_file(self, url, dest, progress_tag=None, name=None, emit_progress=True):
-        return fs.download_file(url, dest, progress_tag=progress_tag, name=name, emit_progress=emit_progress)
+    @staticmethod
+    def to_hf_fallback(url):
+        if not url:
+            return None
+        for gh_prefix, hf_prefix in URL_FALLBACK_MAP:
+            if url.startswith(gh_prefix):
+                return hf_prefix + url[len(gh_prefix) :]
+        return None
+
+    @classmethod
+    def is_url_reachable(cls, url, timeout=3):
+        from urllib.parse import urlparse
+
+        host = urlparse(url).netloc
+        with cls._LOCK:
+            cached = cls.HOST_REACHABLE_CACHE.get(host)
+            if cached:
+                ttl = cls.REACHABILITY_TTL if cached[0] else cls.UNREACHABLE_TTL
+                if (time.time() - cached[1]) < ttl:
+                    return cached[0]
+
+            try:
+                response = requests.head(url, timeout=timeout, allow_redirects=True)
+                # Any HTTP answer below 500 (even 404) proves the host is up.
+                reachable = response.status_code < 500
+            except requests.RequestException:
+                reachable = False
+
+            cls.HOST_REACHABLE_CACHE[host] = (reachable, time.time())
+            return reachable
+
+    @classmethod
+    def mark_reachable(cls, url, reachable):
+        from urllib.parse import urlparse
+
+        host = urlparse(url).netloc
+        with cls._LOCK:
+            cls.HOST_REACHABLE_CACHE[host] = (reachable, time.time())
+            if reachable:
+                cls.NOTIFIED = {k for k in cls.NOTIFIED if k[0] != host}
+
+    @classmethod
+    def host_known_down(cls, url):
+        host = urlparse(url).netloc
+        with cls._LOCK:
+            cached = cls.HOST_REACHABLE_CACHE.get(host)
+            return bool(cached) and not cached[0]
+
+    @classmethod
+    def notify_once(cls, key, text, msg_type="info"):
+        with cls._LOCK:
+            if key in cls.NOTIFIED:
+                return
+            cls.NOTIFIED.add(key)
+        try:
+            output.add_text(text, msg_type=msg_type)
+        except Exception:
+            print(text)
+
+    @classmethod
+    def notify_download_failed(cls, url, item):
+        host = urlparse(url).netloc
+        cls.notify_once((host, "fail", item), f"D2PFX: Unable to download {item} from {host}", msg_type="error")
+
+    @classmethod
+    def notify_fallback_once(cls, gh_url):
+        host = urlparse(gh_url).netloc
+        cls.notify_once((host, "mirror", None), f"{host} unreachable, D2PFX is using the Hugging Face mirror")
+
+    def download_file(self, url, dest, progress_tag=None, name=None, emit_progress=True, fallback_url=None):
+        fallback_url = fallback_url or self.to_hf_fallback(url)
+
+        if not fallback_url or fallback_url == url:
+            return fs.download_file(url, dest, progress_tag=progress_tag, name=name, emit_progress=emit_progress)
+
+        if self.is_url_reachable(url):
+            candidates = [url, fallback_url]
+        else:
+            candidates = [fallback_url, url]
+
+        for candidate in candidates:
+            if fs.download_file(candidate, dest, progress_tag=progress_tag, name=name, emit_progress=emit_progress):
+                if candidate == url:
+                    self.mark_reachable(url, True)
+                elif self.host_known_down(url):
+                    self.notify_fallback_once(url)
+                return True
+            self.notify_download_failed(candidate, name or os.path.basename(urlparse(candidate).path))
+        return False
 
     def fetch_gz_json(self, filename, force_refresh=False):
         local_path = os.path.join(self.cache_dir, filename.replace(".gz", ""))
-        gz_url = f"{BASE_URL}data/{filename}"
+        gh_url = f"{BASE_URL}data/{filename}"
+        hf_url = f"{HF_BASE_URL}data/{filename}"
 
         if not force_refresh and os.path.exists(local_path):
             try:
@@ -47,16 +154,39 @@ class DataManager:
             except Exception:
                 pass
 
-        try:
-            response = requests.get(gz_url, timeout=10)
-            if response.status_code == 200:
+        if self.is_url_reachable(gh_url):
+            candidate_urls = [gh_url, hf_url]
+        else:
+            candidate_urls = [hf_url, gh_url]
+
+        for gz_url in candidate_urls:
+            try:
+                response = requests.get(gz_url, timeout=10)
+                response.raise_for_status()
+            except requests.RequestException as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if gz_url == gh_url and not (status is not None and status < 500):
+                    self.mark_reachable(gh_url, False)
+                self.notify_download_failed(gz_url, filename)
+                continue
+
+            if gz_url == gh_url:
+                self.mark_reachable(gh_url, True)
+            elif self.host_known_down(gh_url):
+                self.notify_fallback_once(gh_url)
+
+            try:
                 with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as f:
                     data = json.load(f)
-                    with open(local_path, "w", encoding="utf-8") as out:
-                        json.dump(data, out, indent=2)
-                    return data
-        except Exception as e:
-            print(f"Error fetching {filename}: {e}")
+            except Exception:
+                continue
+
+            try:
+                with open(local_path, "w", encoding="utf-8") as out:
+                    json.dump(data, out, indent=2)
+            except Exception:
+                pass
+            return data
 
         return None
 
